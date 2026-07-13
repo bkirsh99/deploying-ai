@@ -491,7 +491,7 @@ def clear_chat():
 
 def build_demo() -> gr.Blocks:
     with gr.Blocks(title="TripWise Travel Assistant") as demo:
-        gr.Markdown("# 🌦️ TripWise: Weather-Aware Travel Planner")
+        gr.Markdown("# TripWise: Weather-Aware Travel Planner")
         gr.Markdown(
             "Ask about live weather, packing lists, or day-by-day itineraries. "
             "TripWise remembers your trip details during the chat."
