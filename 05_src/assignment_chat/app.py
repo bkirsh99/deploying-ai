@@ -616,7 +616,7 @@ def build_demo() -> gr.Blocks:
                 include_time=False,
             )
 
-        chatbot = gr.Chatbot(height=520, type="messages")
+        chatbot = gr.Chatbot()
 
         message = gr.Textbox(
             label="Trip details",
