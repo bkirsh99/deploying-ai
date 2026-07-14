@@ -123,8 +123,8 @@ When these topics are detected, the assistant politely declines and redirects th
 Set the required environment variables:
 
 ```
-OPENAI_API_KEY="your_openai_key"
-WEATHERSTACK_API_KEY="your_weatherstack_key"
+export OPENAI_API_KEY="your_openai_key"
+export WEATHERSTACK_API_KEY="your_weatherstack_key"
 ```
 
 Build the vector database:

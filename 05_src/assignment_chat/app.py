@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -360,7 +361,7 @@ Message:
 {message}
 
 Return only valid JSON with these keys:
-location, days, interests, transport, requested_service.
+location, start_date, end_date, days, interests, transport, requested_service.
 requested_service must be one of: weather, packing, itinerary, general.
 Use null for unknown values.
 """
@@ -383,19 +384,123 @@ Use null for unknown values.
     return merged
 
 
-def trim_history(history: list, max_turns: int = 8) -> list:
-    return history[-max_turns:]
+def trim_history(history: list, max_messages: int = 16) -> list:
+    """Keep the most recent Gradio message objects."""
+    return list(history or [])[-max_messages:]
 
 
 def history_to_messages(history: list) -> list[dict[str, str]]:
-    """Convert Gradio tuple history to OpenAI user/assistant messages."""
+    """Convert Gradio messages into OpenAI-compatible messages."""
     messages: list[dict[str, str]] = []
-    for user_text, assistant_text in trim_history(history):
-        if user_text:
-            messages.append({"role": "user", "content": user_text})
-        if assistant_text:
-            messages.append({"role": "assistant", "content": assistant_text})
+    for item in trim_history(history):
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role in {"user", "assistant"} and isinstance(content, str) and content:
+            messages.append({"role": role, "content": content})
     return messages
+
+
+def append_turn(history: list | None, user_text: str, assistant_text: str) -> list:
+    """Append one user/assistant turn in Gradio messages format."""
+    updated = list(history or [])
+    updated.append({"role": "user", "content": user_text})
+    updated.append({"role": "assistant", "content": assistant_text})
+    return updated
+
+
+def format_date_input(value: Any) -> str:
+    """Normalize Gradio date values into YYYY-MM-DD strings."""
+    if value is None or value == "":
+        return ""
+
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value).date().isoformat()
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    # Accept ISO datetimes and plain YYYY-MM-DD values.
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        pass
+
+    # Some Gradio versions serialize timestamps as numeric strings.
+    try:
+        return datetime.fromtimestamp(float(text)).date().isoformat()
+    except (TypeError, ValueError, OSError):
+        return text
+
+
+def call_with_trip_inputs(
+    location: str,
+    start_date: Any,
+    end_date: Any,
+    trip_details: str,
+    chatbot: list | None,
+    memory_state: dict[str, Any] | None,
+):
+    """Validate mandatory trip inputs and combine them with free-text details."""
+    history = list(chatbot or [])
+    memory = dict(memory_state or {})
+
+    location_text = str(location or "").strip()
+    start_text = format_date_input(start_date)
+    end_text = format_date_input(end_date)
+    details_text = str(trip_details or "").strip()
+
+    missing = []
+    if not location_text:
+        missing.append("destination")
+    if not start_text:
+        missing.append("start date")
+    if not end_text:
+        missing.append("end date")
+
+    if missing:
+        reply = "Please provide the required " + ", ".join(missing) + " before sending."
+        shown_message = details_text or "Trip details not entered."
+        return "", append_turn(history, shown_message, reply), memory
+
+    try:
+        start_day = date.fromisoformat(start_text)
+        end_day = date.fromisoformat(end_text)
+    except ValueError:
+        reply = "Please select valid trip dates using the date fields."
+        return "", append_turn(history, details_text or "Trip details", reply), memory
+
+    if end_day < start_day:
+        reply = "The trip end date must be on or after the start date."
+        return "", append_turn(history, details_text or "Trip details", reply), memory
+
+    days = (end_day - start_day).days + 1
+    memory.update(
+        {
+            "location": location_text,
+            "start_date": start_text,
+            "end_date": end_text,
+            "days": days,
+        }
+    )
+
+    combined_message = (
+        f"Destination: {location_text}\n"
+        f"Trip start date: {start_text}\n"
+        f"Trip end date: {end_text}\n"
+        f"Trip length: {days} day{'s' if days != 1 else ''}\n\n"
+        f"Trip details and request:\n{details_text or 'Provide general travel-planning advice.'}"
+    )
+
+    return chat(combined_message, history, memory)
 
 
 def chat(
@@ -408,8 +513,7 @@ def chat(
 
     refusal = guardrail_check(message)
     if refusal:
-        history.append((message, refusal))
-        return "", history, memory
+        return "", append_turn(history, message, refusal), memory
 
     try:
         memory = infer_trip_fields(message, memory)
@@ -422,14 +526,13 @@ def chat(
 
         if not location:
             reply = (
-                "Where are you travelling? I can check the weather, build a "
-                "packing list, and make a day-by-day itinerary."
+                "Please enter your destination and trip dates above before "
+                "submitting your trip details."
             )
-            history.append((message, reply))
-            return "", history, memory
+            return "", append_turn(history, message, reply), memory
 
         try:
-            days = max(1, min(int(memory.get("days") or 3), 14))
+            days = max(1, min(int(memory.get("days") or 3), 30))
         except (TypeError, ValueError):
             days = 3
 
@@ -481,41 +584,76 @@ Answer helpfully as TripWise. Mention that you can also make a packing list or i
             f"Please check the API keys and local vector database. Details: {exc}"
         )
 
-    history.append((message, reply))
-    return "", history, memory
-
+    return "", append_turn(history, message, reply), memory
 
 def clear_chat():
-    return "", [], {}
+    """Clear the conversation and trip-specific input fields."""
+    return "", None, None, "", [], {}
 
 
 def build_demo() -> gr.Blocks:
     with gr.Blocks(title="TripWise Travel Assistant") as demo:
         gr.Markdown("# TripWise: Weather-Aware Travel Planner")
         gr.Markdown(
-            "Ask about live weather, packing lists, or day-by-day itineraries. "
-            "TripWise remembers your trip details during the chat."
+            "Enter a destination and trip dates, then describe who is travelling, "
+            "your interests, transportation preferences, budget, and the type of "
+            "travel help you want."
         )
 
         memory_state = gr.State({})
-        chatbot = gr.Chatbot(height=520)
-        message = gr.Textbox(
-            label="Message",
-            placeholder=(
-                "Example: I’m going to Lisbon for 4 days, love food and museums, "
-                "and will use public transit. Make me a packing list."
-            ),
-        )
-        clear = gr.Button("Clear chat")
 
-        message.submit(
-            chat,
-            inputs=[message, chatbot, memory_state],
+        with gr.Row():
+            location = gr.Textbox(
+                label="Destination (required)",
+                placeholder="Example: Lisbon, Portugal; Tokyo; or Costa Rica",
+            )
+            start_date = gr.DateTime(
+                label="Trip start date (required)",
+                include_time=False,
+            )
+            end_date = gr.DateTime(
+                label="Trip end date (required)",
+                include_time=False,
+            )
+
+        chatbot = gr.Chatbot(height=520, type="messages")
+
+        message = gr.Textbox(
+            label="Trip details",
+            placeholder=(
+                "Example: I’m travelling with my sister. We enjoy food, museums, "
+                "and beaches, will use public transit, and want a packing list."
+            ),
+            lines=4,
+        )
+
+        with gr.Row():
+            send = gr.Button("Send", variant="primary")
+            clear = gr.Button("Clear chat")
+
+        send.click(
+            call_with_trip_inputs,
+            inputs=[
+                location,
+                start_date,
+                end_date,
+                message,
+                chatbot,
+                memory_state,
+            ],
             outputs=[message, chatbot, memory_state],
         )
+
         clear.click(
             clear_chat,
-            outputs=[message, chatbot, memory_state],
+            outputs=[
+                location,
+                start_date,
+                end_date,
+                message,
+                chatbot,
+                memory_state,
+            ],
         )
 
     return demo
